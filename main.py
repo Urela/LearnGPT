@@ -11,10 +11,15 @@ vocab_size = len(chars)
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 block_size = 8 # maximum context length for predictions
 batch_size = 32 # how many independent sequences will we process in paraell ?
-max_iter = 3000
-eval_interval = 300
+max_iters = 5000
+learning_rate = 1e-3
+eval_interval = 500
 eval_iters = 200
+n_embed = 32
+dropout = 0.2
 
+
+torch.manual_seed(1337)
 
 ## Tokenisation
 stoi = {c:i for i,c in enumerate(chars)}
@@ -50,18 +55,91 @@ for b in range(batch_size):
     context = xb[b, :t+1]
     target  = yb[b, t]
     print(f"when input is {context.tolist()} the target: {target}")
-"""
 print(xb)
-
+"""
 import torch.nn as nn
 from torch.nn import functional as F
-class BigramLLM(nn.Module):
-  def __init__(self, vocab_size):
+
+class Head(nn.Module):
+  def __init__(self, head_size):
     super().__init__()
-    self.token_embedding_table = nn.Embedding(vocab_size, vocab_size)
+    self.key   = nn.Linear(n_embed, head_size, bias=False)
+    self.query = nn.Linear(n_embed, head_size, bias=False)
+    self.value = nn.Linear(n_embed, head_size, bias=False)
+    self.register_buffer('tril', torch.tril(torch.ones(block_size, block_size)))
+    self.dropout = nn.Dropout(dropout) 
+  def forward(self, x):
+    B,T,C = x.shape
+    k = self.key(x)
+    q = self.query(x)
+    wei = q@k.transpose(-2,-1) * C**-0.5
+    wei = wei.masked_fill( self.tril[:T, :T] **0, float('-inf'))
+    wei = F.softmax(wei,dim=-1) # B,T,T
+    wei = self.dropout(wei)
+    v = self.value(x)
+    out = wei @ v
+    return out
+
+
+class MultiHeadAttention(nn.Module):
+  def __init__(self, num_heads, head_size):
+    super().__init__()
+    self.heads = nn.ModuleList([Head(head_size) for _ in range(num_heads)]) 
+    self.proj = nn.Linear(n_embed, n_embed)
+    self.dropout = nn.Dropout(dropout) 
+  def forward(self, x):
+    out = torch.cat( [h(x) for h in self.heads], dim=-1 )
+    out = self.dropout(self.proj(out)) 
+    return out
+
+class FeedForward(nn.Module):
+  def __init__(self, n_embed):
+    super().__init__()
+    self.net = nn.Sequential(
+      nn.Linear(n_embed, 4*n_embed), 
+      nn.ReLU(),
+      nn.Linear(4*n_embed, n_embed),  # projection layer
+      nn.Dropout(dropout) 
+    )
+  def forward(self, x):
+    return self.net(x)
+
+
+class Block(nn.Module):
+  def __init__(self, n_embed, n_head):
+    super().__init__()
+    head_size = n_embed// n_head
+    self.sa = MultiHeadAttention(n_head, head_size)
+    self.ffwd = FeedForward(n_embed)
+    self.ln1 = nn.LayerNorm(n_embed)
+    self.ln2 = nn.LayerNorm(n_embed)
+  def forward(self, x):
+    x = x + self.sa(self.ln1(x))
+    x = x + self.ffwd(self.ln2(x))
+    return x
+
+class BigramLLM(nn.Module):
+  def __init__(self):
+    super().__init__()
+    self.token_embedding_table = nn.Embedding(vocab_size, n_embed)
+    self.position_embedding_table = nn.Embedding(block_size, n_embed)
+    #self.sa_head = Head(n_embed) # self attention head
+    self.blocks = nn.Sequential(
+      Block(n_embed, n_head=4),
+      Block(n_embed, n_head=4),
+      Block(n_embed, n_head=4),
+      nn.LayerNorm(n_embed)
+    )
+    self.lm_head = nn.Linear(n_embed, vocab_size)
+
   def forward(self, idx, targets = None):
     # idx and targets are both (B,T)_ tensor of integers
-    logits = self.token_embedding_table(idx) # (B,T,C)
+    B,T = idx.shape
+    tok_emb = self.token_embedding_table(idx) # (B,T,C1)
+    pos_emb = self.position_embedding_table(torch.arange(T, device=device)) # (B,T,C1)
+    x = tok_emb + pos_emb
+    x = self.blocks(x) # (B,T,C)
+    logits = self.lm_head(x) # (B,T,C2)
 
     if targets is not None:
       B,T,C = logits.shape
@@ -73,7 +151,8 @@ class BigramLLM(nn.Module):
 
   def generate(self, idx, max_new_tokens):
     for _ in range(max_new_tokens):
-      logits, loss = self(idx)
+      idx_cond = idx[:, -block_size:]
+      logits, loss = self(idx_cond)
       #focus on the last time step
       logits = logits[:,-1,:] # (B,C)
       probs = F.softmax(logits, dim=-1)
@@ -81,16 +160,14 @@ class BigramLLM(nn.Module):
       idx = torch.cat((idx, idx_next), dim=1)
     return idx
 
-model = BigramLLM(vocab_size).to(device)
+model = BigramLLM().to(device)
+optim = torch.optim.AdamW(model.parameters(), lr=learning_rate)
 logits, loss = model(xb,yb)
-print(loss)
-#print(logits.shape)
-print(decode(model.generate(idx = torch.zeros((1,1), dtype=torch.long), max_new_tokens=100)[0].tolist()))
 
 @torch.no_grad()
 def estimate_loss():
   out = {}
-  #model.eval()
+  model.eval()
   for split in ['train', 'test']:
       losses = torch.zeros(eval_iters)
       for k in range(eval_iters):
@@ -98,22 +175,18 @@ def estimate_loss():
         logits, loss = model(x, y)
         losses[k] = loss.item()
       out[split] = losses.mean()
-  #model.train()
+  model.train()
   return out
 
-optim = torch.optim.AdamW(model.parameters(), lr=1e-3)
-batch_size = 32
-
-for steps in range(10000):
-  if steps % eval_interval == 0:
+for steps in range(max_iters):
+  if steps % eval_interval == 0 or steps == max_iters - 1:
     losses = estimate_loss()
     print(f"step {steps}: train loss {losses['train']:.4f}, val loss {losses['test']:.4f}")
   # sampled a batch of data
   xb, yb = get_batch("train")
   logits, loss = model(xb, yb)
-  optim.zero_grad()
+  optim.zero_grad(set_to_none=True)
   loss.backward()
   optim.step()
-print(loss.item())
 context = torch.zeros((1,1), dtype=torch.long, device=device)
 print(decode(model.generate(context, max_new_tokens=500)[0].tolist()))
